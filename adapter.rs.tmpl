@@ -1,0 +1,673 @@
+//! Agnes AI adapter for Codex++.
+//!
+//! This module owns all Agnes-specific model detection, request translation,
+//! image/video handling, and provider discovery. Keep provider-specific logic
+//! here so upstream Codex++ changes only need the small hooks installed by the
+//! sync script.
+
+use std::time::{Duration, Instant};
+
+use anyhow::Context;
+use serde_json::{Value, json};
+
+use crate::protocol_proxy::{ProxyHttpResponse, responses_error_from_upstream};
+use crate::settings::{BackendSettings, RelayProfile, SettingsStore};
+
+pub const PROVIDER_NAME: &str = "__AGNES_PROVIDER_NAME__";
+const AGNES_TEXT_MODEL: &str = "__AGNES_TEXT_MODEL__";
+const AGNES_IMAGE_MODEL: &str = "__AGNES_IMAGE_MODEL__";
+const AGNES_VIDEO_MODEL: &str = "__AGNES_VIDEO_MODEL__";
+const AGNES_VIDEO_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const AGNES_VIDEO_POLL_TIMEOUT: Duration = Duration::from_secs(900);
+const AGNES_IMAGE_HEADER_TIMEOUT: Duration = Duration::from_secs(600);
+
+const AGNES_HOSTS: &[&str] = &[
+    "apihub.agnes-ai.com",
+    "apihub.agnes-ai.cn",
+    "api.agnes-ai.cn",
+];
+
+pub const MODEL_IDS: &[&str] = &[
+    AGNES_TEXT_MODEL,
+    AGNES_IMAGE_MODEL,
+    AGNES_VIDEO_MODEL,
+];
+
+pub fn is_text_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case(AGNES_TEXT_MODEL)
+}
+
+pub fn is_image_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case(AGNES_IMAGE_MODEL)
+}
+
+pub fn is_video_model(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case(AGNES_VIDEO_MODEL)
+}
+
+pub fn is_model(model: &str) -> bool {
+    is_text_model(model) || is_image_model(model) || is_video_model(model)
+}
+
+pub fn is_upstream(relay: &RelayProfile) -> bool {
+    let base_url = if relay.upstream_base_url.trim().is_empty() {
+        crate::relay_config::relay_profile_base_url(relay)
+    } else {
+        relay.upstream_base_url.trim().to_string()
+    };
+    let Ok(url) = reqwest::Url::parse(base_url.trim()) else {
+        return false;
+    };
+    url.host_str()
+        .map(|host| AGNES_HOSTS.iter().any(|candidate| host.eq_ignore_ascii_case(candidate)))
+        .unwrap_or(false)
+}
+
+pub fn is_configured(settings: &BackendSettings) -> bool {
+    settings.relay_profiles.iter().any(|profile| {
+        is_upstream(profile) && (!profile.api_key.trim().is_empty() || profile.uses_no_auth())
+    })
+}
+
+pub fn configured_relay(settings: &BackendSettings) -> anyhow::Result<RelayProfile> {
+    settings
+        .relay_profiles
+        .iter()
+        .find(|profile| {
+            is_upstream(profile) && (!profile.api_key.trim().is_empty() || profile.uses_no_auth())
+        })
+        .cloned()
+        .context("Agnes 模型已加入模型列表，但没有找到可用的 Agnes AI Provider")
+}
+
+fn effective_user_agent(configured_user_agent: &str, original_user_agent: Option<&str>) -> String {
+    let configured_user_agent = configured_user_agent.trim();
+    if !configured_user_agent.is_empty() {
+        return configured_user_agent.to_string();
+    }
+    original_user_agent
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn with_relay_auth(
+    request: reqwest::RequestBuilder,
+    relay: &RelayProfile,
+) -> reqwest::RequestBuilder {
+    crate::relay_headers::apply(request, relay)
+}
+
+fn base_url(relay: &RelayProfile) -> String {
+    if relay.upstream_base_url.trim().is_empty() {
+        crate::relay_config::relay_profile_base_url(relay)
+    } else {
+        relay.upstream_base_url.trim().to_string()
+    }
+}
+
+fn image_generations_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    if base.to_ascii_lowercase().ends_with("/images/generations") {
+        return base.to_string();
+    }
+    if base.to_ascii_lowercase().ends_with("/v1") {
+        return format!("{base}/images/generations");
+    }
+    format!("{base}/v1/images/generations")
+}
+
+fn video_generations_url(base_url: &str) -> String {
+    let base = base_url.trim().trim_end_matches('#').trim_end_matches('/');
+    if base.to_ascii_lowercase().ends_with("/videos") {
+        return base.to_string();
+    }
+    let mut root = base.to_string();
+    if let Ok(mut url) = reqwest::Url::parse(base) {
+        let path = url.path().trim_end_matches('/');
+        if path.ends_with("/v1") {
+            url.set_path(path.trim_end_matches("/v1"));
+        }
+        url.set_query(None);
+        root = url.to_string().trim_end_matches('/').to_string();
+    }
+    format!("{root}/v1/videos")
+}
+
+fn video_result_url(base_url: &str, video_id: &str) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(base_url.trim())?;
+    url.set_path("/agnesapi");
+    url.set_query(None);
+    {
+        let mut pairs = url.query_pairs_mut();
+        pairs.append_pair("video_id", video_id);
+        pairs.append_pair("model_name", AGNES_VIDEO_MODEL);
+    }
+    Ok(url.to_string())
+}
+
+fn response_stream_requested(body: &Value) -> bool {
+    body.get("stream").and_then(Value::as_bool).unwrap_or(false)
+}
+
+fn response_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn push_sse(output: &mut String, event: &str, data: Value) {
+    output.push_str("event: ");
+    output.push_str(event);
+    output.push_str("\ndata: ");
+    output.push_str(&serde_json::to_string(&data).unwrap_or_default());
+    output.push_str("\n\n");
+}
+
+fn responses_output_text_response(model: &str, text: &str, stream: bool) -> ProxyHttpResponse {
+    let response_id = format!("resp_agnes_{}", uuid::Uuid::new_v4().simple());
+    let output_item = json!({
+        "id": format!("msg_{}", uuid::Uuid::new_v4().simple()),
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{ "type": "output_text", "text": text, "annotations": [] }],
+    });
+    let response = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": response_timestamp(),
+        "status": "completed",
+        "model": model,
+        "output": [output_item.clone()],
+    });
+
+    if !stream {
+        return ProxyHttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "application/json; charset=utf-8".to_string(),
+            body: serde_json::to_vec(&response).unwrap_or_default(),
+        };
+    }
+
+    let mut sse = String::new();
+    push_sse(&mut sse, "response.created", json!({
+        "type": "response.created",
+        "response": response.clone(),
+    }));
+    push_sse(&mut sse, "response.output_item.added", json!({
+        "type": "response.output_item.added",
+        "response_id": response["id"],
+        "output_index": 0,
+        "item": output_item.clone(),
+    }));
+    push_sse(&mut sse, "response.output_item.done", json!({
+        "type": "response.output_item.done",
+        "response_id": response["id"],
+        "output_index": 0,
+        "item": output_item,
+    }));
+    push_sse(&mut sse, "response.completed", json!({
+        "type": "response.completed",
+        "response": response,
+    }));
+    ProxyHttpResponse {
+        status: "200 OK".to_string(),
+        content_type: "text/event-stream; charset=utf-8".to_string(),
+        body: sse.into_bytes(),
+    }
+}
+
+fn responses_image_response(model: &str, image_base64: &str, stream: bool) -> ProxyHttpResponse {
+    let response_id = format!("resp_agnes_{}", uuid::Uuid::new_v4().simple());
+    let output_item = json!({
+        "id": format!("ig_{}", uuid::Uuid::new_v4().simple()),
+        "type": "image_generation_call",
+        "status": "completed",
+        "result": image_base64,
+    });
+    let response = json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": response_timestamp(),
+        "status": "completed",
+        "model": model,
+        "output": [output_item.clone()],
+    });
+    if !stream {
+        return ProxyHttpResponse {
+            status: "200 OK".to_string(),
+            content_type: "application/json; charset=utf-8".to_string(),
+            body: serde_json::to_vec(&response).unwrap_or_default(),
+        };
+    }
+    let mut sse = String::new();
+    push_sse(&mut sse, "response.created", json!({
+        "type": "response.created",
+        "response": response.clone(),
+    }));
+    push_sse(&mut sse, "response.output_item.added", json!({
+        "type": "response.output_item.added",
+        "response_id": response["id"],
+        "output_index": 0,
+        "item": output_item.clone(),
+    }));
+    push_sse(&mut sse, "response.output_item.done", json!({
+        "type": "response.output_item.done",
+        "response_id": response["id"],
+        "output_index": 0,
+        "item": output_item,
+    }));
+    push_sse(&mut sse, "response.completed", json!({
+        "type": "response.completed",
+        "response": response,
+    }));
+    ProxyHttpResponse {
+        status: "200 OK".to_string(),
+        content_type: "text/event-stream; charset=utf-8".to_string(),
+        body: sse.into_bytes(),
+    }
+}
+
+fn collect_user_text(value: &Value, role: Option<&str>, output: &mut String) {
+    match value {
+        Value::String(text) => {
+            if role == Some("user") && !text.trim().is_empty() {
+                if !output.is_empty() {
+                    output.push('\n');
+                }
+                output.push_str(text.trim());
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_user_text(item, role, output);
+            }
+        }
+        Value::Object(map) => {
+            let next_role = map.get("role").and_then(Value::as_str).or(role);
+            if map.get("type").and_then(Value::as_str) == Some("input_text") {
+                if let Some(text) = map.get("text").and_then(Value::as_str) {
+                    if next_role == Some("user") && !text.trim().is_empty() {
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        output.push_str(text.trim());
+                    }
+                }
+                return;
+            }
+            for (key, child) in map {
+                if key != "role" {
+                    collect_user_text(child, next_role, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn responses_input_text(body: &Value) -> String {
+    let mut output = String::new();
+    if let Some(instructions) = body.get("instructions").and_then(Value::as_str) {
+        if !instructions.trim().is_empty() {
+            output.push_str(instructions.trim());
+        }
+    }
+    collect_user_text(body.get("input").unwrap_or(&Value::Null), None, &mut output);
+    output
+}
+
+fn collect_input_images(value: &Value, output: &mut Vec<String>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_input_images(item, output);
+            }
+        }
+        Value::Object(map) => {
+            if map.get("type").and_then(Value::as_str) == Some("input_image") {
+                for key in ["image_url", "url"] {
+                    if let Some(url) = map.get(key).and_then(Value::as_str) {
+                        let url = url.trim();
+                        if !url.is_empty() {
+                            output.push(url.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+            for (key, child) in map {
+                if key != "image_url" && key != "url" {
+                    collect_input_images(child, output);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn responses_input_images(body: &Value) -> Vec<String> {
+    let mut images = Vec::new();
+    collect_input_images(body.get("input").unwrap_or(&Value::Null), &mut images);
+    images
+}
+
+fn image_request_from_responses(body: &Value) -> anyhow::Result<Value> {
+    let prompt = responses_input_text(body);
+    if prompt.trim().is_empty() {
+        anyhow::bail!("Agnes 图片模型需要至少一段用户提示词");
+    }
+
+    let size = body
+        .get("size")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("1K");
+
+    let mut request = json!({
+        "model": AGNES_IMAGE_MODEL,
+        "prompt": prompt,
+        "size": size,
+    });
+    if let Some(ratio) = body.get("ratio").and_then(Value::as_str) {
+        request["ratio"] = json!(ratio);
+    }
+
+    let mut extra_body = body
+        .get("extra_body")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    extra_body.insert("response_format".to_string(), json!("b64_json"));
+    let image_inputs = responses_input_images(body);
+    if !image_inputs.is_empty() {
+        extra_body.insert("image".to_string(), json!(image_inputs));
+    }
+    request["extra_body"] = Value::Object(extra_body);
+    Ok(request)
+}
+
+fn video_request_from_responses(body: &Value) -> anyhow::Result<Value> {
+    let prompt = responses_input_text(body);
+    if prompt.trim().is_empty() {
+        anyhow::bail!("Agnes 视频模型需要至少一段用户提示词");
+    }
+    let mut request = json!({
+        "model": AGNES_VIDEO_MODEL,
+        "prompt": prompt,
+        "mode": "text",
+        "seconds": "5",
+        "size": "720P",
+        "aspect_ratio": "16:9",
+    });
+    for key in ["mode", "seconds", "size", "aspect_ratio", "seed", "n"] {
+        if let Some(value) = body.get(key) {
+            request[key] = value.clone();
+        }
+    }
+    Ok(request)
+}
+
+fn video_id_from_response(value: &Value) -> Option<String> {
+    ["video_id", "id", "task_id"]
+        .into_iter()
+        .find_map(|key| value.get(key).and_then(Value::as_str).map(str::trim))
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn video_url_from_result(value: &Value) -> Option<String> {
+    value
+        .get("url")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("metadata").and_then(|meta| meta.get("url")).and_then(Value::as_str))
+        .or_else(|| value.get("video_url").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+async fn open_video_response(
+    body: &Value,
+    original_user_agent: Option<&str>,
+    relay: &RelayProfile,
+) -> anyhow::Result<ProxyHttpResponse> {
+    let request_body = video_request_from_responses(body)?;
+    let base = base_url(relay);
+    let endpoint = video_generations_url(&base);
+    let client = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?;
+
+    let create = crate::protocol_proxy::send_upstream_request_with_header_timeout(
+        with_relay_auth(
+            client
+                .post(&endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&request_body),
+            relay,
+        ),
+        AGNES_IMAGE_HEADER_TIMEOUT,
+    )
+    .await?;
+    let status_code = create.status().as_u16();
+    let create_content_type = create
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json; charset=utf-8")
+        .to_string();
+    let create_body = create.bytes().await?;
+    if !(200..300).contains(&status_code) {
+        return Ok(ProxyHttpResponse {
+            status: format!("{status_code} Upstream"),
+            content_type: "application/json; charset=utf-8".to_string(),
+            body: serde_json::to_vec(&responses_error_from_upstream(
+                status_code,
+                &create_content_type,
+                &create_body,
+            ))?,
+        });
+    }
+
+    let create_json: Value = serde_json::from_slice(&create_body)?;
+    let video_id = video_id_from_response(&create_json)
+        .context("Agnes 视频创建响应缺少 video_id")?;
+    let poll_url = video_result_url(&base, &video_id)?;
+    let started = Instant::now();
+
+    loop {
+        if started.elapsed() > AGNES_VIDEO_POLL_TIMEOUT {
+            anyhow::bail!("Agnes 视频生成轮询超过 15 分钟仍未完成");
+        }
+        tokio::time::sleep(AGNES_VIDEO_POLL_INTERVAL).await;
+        let poll = crate::protocol_proxy::send_upstream_request_with_header_timeout(
+            with_relay_auth(
+                client
+                    .get(&poll_url)
+                    .header(reqwest::header::ACCEPT, "application/json"),
+                relay,
+            ),
+            crate::protocol_proxy::upstream_header_timeout(),
+        )
+        .await?;
+        let poll_status_code = poll.status().as_u16();
+        let poll_body = poll.bytes().await?;
+        if !(200..300).contains(&poll_status_code) {
+            return Ok(ProxyHttpResponse {
+                status: format!("{poll_status_code} Upstream"),
+                content_type: "application/json; charset=utf-8".to_string(),
+                body: serde_json::to_vec(&responses_error_from_upstream(
+                    poll_status_code,
+                    "application/json",
+                    &poll_body,
+                ))?,
+            });
+        }
+        let result: Value = serde_json::from_slice(&poll_body)?;
+        let status = result
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if let Some(url) = video_url_from_result(&result) {
+            return Ok(responses_output_text_response(
+                AGNES_VIDEO_MODEL,
+                &format!("Agnes 视频已生成：{url}"),
+                response_stream_requested(body),
+            ));
+        }
+        if matches!(status.as_str(), "failed" | "error") {
+            let message = result
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Agnes 视频生成失败");
+            anyhow::bail!("{message}");
+        }
+    }
+}
+
+async fn open_image_response(
+    body: &Value,
+    original_user_agent: Option<&str>,
+    relay: &RelayProfile,
+) -> anyhow::Result<ProxyHttpResponse> {
+    let request_body = image_request_from_responses(body)?;
+    let base = base_url(relay);
+    let endpoint = image_generations_url(&base);
+    let client = crate::http_client::proxied_client(&effective_user_agent(
+        &relay.user_agent,
+        original_user_agent,
+    ))?;
+    let upstream = crate::protocol_proxy::send_upstream_request_with_header_timeout(
+        with_relay_auth(
+            client
+                .post(&endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .json(&request_body),
+            relay,
+        ),
+        AGNES_IMAGE_HEADER_TIMEOUT,
+    )
+    .await?;
+    let status_code = upstream.status().as_u16();
+    let content_type = upstream
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("application/json; charset=utf-8")
+        .to_string();
+    let body_bytes = upstream.bytes().await?;
+    if !(200..300).contains(&status_code) {
+        return Ok(ProxyHttpResponse {
+            status: format!("{status_code} Upstream"),
+            content_type: "application/json; charset=utf-8".to_string(),
+            body: serde_json::to_vec(&responses_error_from_upstream(
+                status_code,
+                &content_type,
+                &body_bytes,
+            ))?,
+        });
+    }
+    let response_json: Value = serde_json::from_slice(&body_bytes)?;
+    let image_base64 = response_json
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                item.get("b64_json")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+            })
+        })
+        .context("Agnes 图片响应中没有 b64_json；请确认 extra_body.response_format=b64_json 可用")?;
+    Ok(responses_image_response(
+        AGNES_IMAGE_MODEL,
+        image_base64,
+        response_stream_requested(body),
+    ))
+}
+
+pub async fn handle_media_model_response(
+    body: &str,
+    original_user_agent: Option<&str>,
+) -> anyhow::Result<Option<ProxyHttpResponse>> {
+    let request_json: Value = serde_json::from_str(body)?;
+    let model = request_json
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !is_image_model(model) && !is_video_model(model) {
+        return Ok(None);
+    }
+
+    let settings = SettingsStore::default().load().unwrap_or_default();
+    let relay = configured_relay(&settings)?;
+    if is_video_model(model) {
+        return Ok(Some(open_video_response(
+            &request_json,
+            original_user_agent,
+            &relay,
+        ).await?));
+    }
+    Ok(Some(open_image_response(
+        &request_json,
+        original_user_agent,
+        &relay,
+    ).await?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_manifest_models() {
+        assert_eq!(MODEL_IDS, &[AGNES_TEXT_MODEL, AGNES_IMAGE_MODEL, AGNES_VIDEO_MODEL]);
+        assert!(is_text_model(AGNES_TEXT_MODEL));
+        assert!(is_image_model(AGNES_IMAGE_MODEL));
+        assert!(is_video_model(AGNES_VIDEO_MODEL));
+        assert!(!is_model("gpt-5.5"));
+    }
+
+    #[test]
+    fn image_request_uses_agnes_extra_body_contract() {
+        let body = json!({
+            "model": AGNES_IMAGE_MODEL,
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "a red fox"}]
+            }],
+            "size": "2K",
+            "ratio": "16:9"
+        });
+        let request = image_request_from_responses(&body).expect("image request");
+        assert_eq!(request["model"], AGNES_IMAGE_MODEL);
+        assert_eq!(request["prompt"], "a red fox");
+        assert_eq!(request["size"], "2K");
+        assert_eq!(request["ratio"], "16:9");
+        assert_eq!(request["extra_body"]["response_format"], "b64_json");
+    }
+
+    #[test]
+    fn video_request_defaults_to_fast_720p_text_mode() {
+        let body = json!({
+            "model": AGNES_VIDEO_MODEL,
+            "input": [{
+                "role": "user",
+                "content": [{"type": "input_text", "text": "a city skyline at dusk"}]
+            }]
+        });
+        let request = video_request_from_responses(&body).expect("video request");
+        assert_eq!(request["model"], AGNES_VIDEO_MODEL);
+        assert_eq!(request["mode"], "text");
+        assert_eq!(request["seconds"], "5");
+        assert_eq!(request["size"], "720P");
+        assert_eq!(request["aspect_ratio"], "16:9");
+    }
+}

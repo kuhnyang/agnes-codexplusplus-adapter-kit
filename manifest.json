@@ -1,0 +1,34 @@
+{
+  "integrationVersion": 1,
+  "providerId": "agnes-ai",
+  "providerName": "Agnes AI",
+  "websiteUrl": "https://agnes-ai.com",
+  "apiKeyUrl": "https://platform.agnes-ai.com",
+  "baseUrl": "https://apihub.agnes-ai.com/v1",
+  "alternateBaseUrls": [
+    "https://apihub.agnes-ai.cn/v1",
+    "https://api.agnes-ai.cn/v1"
+  ],
+  "protocol": "chatCompletions",
+  "models": [
+    {
+      "id": "agnes-2.5-flash",
+      "label": "Agnes 2.5 Flash",
+      "kind": "text",
+      "endpoint": "/v1/chat/completions"
+    },
+    {
+      "id": "agnes-image-2.5-flash",
+      "label": "Agnes Image 2.5 Flash",
+      "kind": "image",
+      "endpoint": "/v1/images/generations"
+    },
+    {
+      "id": "agnes-video-2.5-flash",
+      "label": "Agnes Video 2.5 Flash",
+      "kind": "video",
+      "endpoint": "/v1/videos"
+    }
+  ],
+  "videoPollingPath": "/agnesapi"
+}
